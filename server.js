@@ -26,25 +26,18 @@ app.post('/generate', async (req, res) => {
     const ctx = nombre
       ? `Usuario: ${nombre} (${generoLabel}), ${edad || '?'} años, ${peso || '?'} kg. Lesiones: ${notas || 'ninguna'}.`
       : '';
-    const variantCtx = variante ? `Variante #${variante} — usa ejercicios DIFERENTES a los habituales, varía el orden y los movimientos para sorprender al usuario.` : '';
-    const historialCtx = historial ? `Ejercicios recientes que ya hizo (EVÍTALOS o usa variantes): ${historial}` : '';
+    const variantCtx = variante ? `Variante #${variante} — usa ejercicios DIFERENTES a los habituales.` : '';
+    const historialCtx = historial ? `Ejercicios recientes (EVÍTALOS o usa variantes): ${historial}` : '';
 
-    const prompt = `Eres un entrenador personal experto en periodización y variedad de entrenamiento. Crea un plan ÚNICO de 6 días Push/Pull/Legs.
+    const prompt = `Eres un entrenador personal experto. Crea un plan de 6 días Push/Pull/Legs.
 ${ctx}
 ${variantCtx}
 ${historialCtx}
 Objetivo: ${objetivo}. Nivel: ${nivel}. Equipo: ${equipo || 'sin equipo'}.
-IMPORTANTE: Responde COMPLETAMENTE en ${langOut}. Nombres de ejercicios específicos y claros. Incluye variedad real — no siempre los mismos ejercicios básicos.
-Estructura exacta:
-- Día 1 Lunes: Pecho + Tríceps (Push A)
-- Día 2 Martes: Espalda + Bíceps (Pull A)
-- Día 3 Miércoles: Piernas + Glúteos (Legs A)
-- Día 4 Jueves: Hombros + Tríceps (Push B)
-- Día 5 Viernes: Espalda + Bíceps (Pull B)
-- Día 6 Sábado: Piernas + Core (Legs B)
-Responde SOLO JSON sin backticks:
-{"titulo":"nombre plan creativo","nivel":"${nivel}","objetivo":"${objetivo}","consejo":"consejo motivador personalizado","dias":[{"dia":"Día 1 — Lunes","grupo":"Pecho + Tríceps","tipo":"Push A","duracion":"50-60 min","ejercicios":[{"nombre":"ejercicio específico","series":4,"reps":"8-12","descanso":"90s","musculos":"músculo"}]}]}
-5-6 ejercicios por día.`;
+IMPORTANTE: Responde COMPLETAMENTE en ${langOut}. USA SOLO JSON VÁLIDO, sin texto adicional, sin backticks, sin comentarios.
+Estructura EXACTA (respeta las comillas dobles):
+{"titulo":"nombre plan","nivel":"${nivel}","objetivo":"${objetivo}","consejo":"consejo motivador","dias":[{"dia":"Día 1 — Lunes","grupo":"Pecho + Tríceps","tipo":"Push A","duracion":"50-60 min","ejercicios":[{"nombre":"ejercicio","series":4,"reps":"8-12","descanso":"90s","musculos":"músculo principal"}]}]}
+Incluye exactamente 6 días, 5-6 ejercicios por día. NO incluyas el día de descanso en el JSON.`;
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -55,36 +48,66 @@ Responde SOLO JSON sin backticks:
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
-        max_tokens: 3500,
+        max_tokens: 4000,
         messages: [{ role: 'user', content: prompt }]
       })
     });
 
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Anthropic API error ${response.status}: ${errText.slice(0,200)}`);
+    }
+
     const data = await response.json();
     if (data.error) return res.status(500).json({ error: data.error.message });
+    if (!data.content || !data.content.length) throw new Error('Empty response from AI');
 
     const rawTxt = data.content.map(c => c.text || '').join('');
-    const jsonStart = rawTxt.indexOf('{');
-    const jsonEnd = rawTxt.lastIndexOf('}');
-    if (jsonStart === -1 || jsonEnd === -1) throw new Error('No JSON in response');
+    console.log('Raw AI response (first 300):', rawTxt.slice(0, 300));
 
-    let txt = rawTxt.slice(jsonStart, jsonEnd + 1)
-      .replace(/[\u201c\u201d]/g, '"')
-      .replace(/[\u2018\u2019]/g, "'")
-      .replace(/,\s*}/g, '}')
-      .replace(/,\s*]/g, ']');
+    // Extract JSON more robustly
+    let txt = rawTxt;
 
-    const plan = JSON.parse(txt);
+    // Remove markdown code blocks if present
+    txt = txt.replace(/```json\s*/gi, '').replace(/```\s*/g, '');
+
+    // Find the outermost { }
+    const jsonStart = txt.indexOf('{');
+    const jsonEnd = txt.lastIndexOf('}');
+    if (jsonStart === -1 || jsonEnd === -1) {
+      throw new Error('No JSON found in response: ' + rawTxt.slice(0, 100));
+    }
+    txt = txt.slice(jsonStart, jsonEnd + 1);
+
+    // Fix common AI JSON mistakes
+    txt = txt
+      .replace(/[\u201c\u201d]/g, '"')   // smart double quotes
+      .replace(/[\u2018\u2019]/g, "'")   // smart single quotes
+      .replace(/,\s*}/g, '}')            // trailing commas in objects
+      .replace(/,\s*]/g, ']')            // trailing commas in arrays
+      .replace(/\n/g, ' ')               // newlines inside strings
+      .replace(/\t/g, ' ');              // tabs
+
+    let plan;
+    try {
+      plan = JSON.parse(txt);
+    } catch (parseErr) {
+      console.error('JSON parse error:', parseErr.message);
+      console.error('Attempted to parse:', txt.slice(0, 500));
+      throw new Error('Invalid JSON from AI: ' + parseErr.message);
+    }
+
+    // Validate structure
+    if (!plan.dias || !Array.isArray(plan.dias) || plan.dias.length === 0) {
+      throw new Error('Plan missing dias array');
+    }
+
     res.json({ success: true, plan });
 
   } catch (err) {
-    console.error('Error:', err.message);
+    console.error('Generate error:', err.message);
     res.status(500).json({ error: err.message });
   }
-});
-
-app.listen(PORT, () => {
-  console.log(`JV Training server running on port ${PORT}`);
 });
 
 // ── PEXELS VIDEO SEARCH ──────────────────────────────────────────────────────
@@ -96,13 +119,10 @@ app.get('/video', async (req, res) => {
     const PEXELS_KEY = process.env.PEXELS_API_KEY;
     if (!PEXELS_KEY) return res.status(500).json({ error: 'Pexels API key not configured' });
 
-    // Build search query in the right language
-    const langSuffix = { es: 'ejercicio', en: 'exercise', pt: 'exercício', fr: 'exercice' };
-    const suffix = langSuffix[lang] || 'exercise';
-    const query = encodeURIComponent(`${q} ${suffix}`);
+    const query = encodeURIComponent(`${q} exercise workout`);
 
     const response = await fetch(
-      `https://api.pexels.com/v1/videos/search?query=${query}&per_page=6&orientation=landscape&size=medium`,
+      `https://api.pexels.com/v1/videos/search?query=${query}&per_page=6&orientation=landscape`,
       { headers: { Authorization: PEXELS_KEY } }
     );
 
@@ -110,7 +130,6 @@ app.get('/video', async (req, res) => {
 
     const data = await response.json();
     const videos = (data.videos || []).map(v => {
-      // Pick the best quality MP4 file (prefer HD, fallback to SD)
       const files = v.video_files || [];
       const hd = files.find(f => f.quality === 'hd' && f.file_type === 'video/mp4');
       const sd = files.find(f => f.quality === 'sd' && f.file_type === 'video/mp4');
@@ -131,4 +150,8 @@ app.get('/video', async (req, res) => {
     console.error('Pexels error:', err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+app.listen(PORT, () => {
+  console.log(`JV Training server running on port ${PORT}`);
 });
